@@ -8,6 +8,8 @@ from .policy import Policy
 
 import latentsafesets.utils.pytorch_utils as ptu
 import latentsafesets.utils.spb_utils as spbu
+from latentsafesets.utils.broil_utils import cvar_enumerate_pg, get_reward_distribution
+from latentsafesets.utils.pointbot_reward_utils import PointBotReward
 from latentsafesets.modules import VanillaVAE, PETSDynamics, ValueFunction, ConstraintEstimator, \
     GoalIndicator
 
@@ -94,20 +96,21 @@ class CEMSafeSetPolicy(Policy):
                     action_samples_random = self._sample_actions_random(num_random)
                     action_samples = torch.cat((action_samples_dist, action_samples_random), dim=0)
             else:
-                # Chop off the numer of elites so we don't use constraint violating trajectories
-                num_constraint_satisfying = sum(values > -1e5)
-                iter_num_elites = min(num_constraint_satisfying, self.num_elites)
+                # Chop off the number of elites so we don't use constraint violating trajectories
 
-                if num_constraint_satisfying == 0:
-                    reset_count += 1
-                    act_ss_thresh *= self.safe_set_thresh_mult
-                    if reset_count > self.safe_set_thresh_mult_iters:
-                        self.mean = None
-                        return self.env.action_space.sample()
+                # num_constraint_satisfying = sum(values > -1e5)
+                #iter_num_elites = min(num_constraint_satisfying, self.num_elites)
+                iter_num_elites = self.num_elites
+                # if num_constraint_satisfying == 0:
+                #     reset_count += 1
+                #     act_ss_thresh *= self.safe_set_thresh_mult
+                #     if reset_count > self.safe_set_thresh_mult_iters:
+                #         self.mean = None
+                #         return self.env.action_space.sample()
 
-                    itr = 0
-                    self.mean, self.std = None, None
-                    continue
+                #     itr = 0
+                #     self.mean, self.std = None, None
+                #     continue
 
                 # Sort
                 sortid = values.argsort()
@@ -126,7 +129,8 @@ class CEMSafeSetPolicy(Policy):
 
                 last_states = predictions[:, :, -1, :].reshape(
                     (num_models * num_candidates, d_latent))
-                all_values = self.value_function.get_value(last_states, already_embedded=True)
+                #all_values = self.value_function.get_value(last_states, already_embedded=True) 
+                all_values = self.compute_broil_weights(last_states) #use compute broil weights to compute values for cem candidates instead of value function
                 nans = torch.isnan(all_values)
                 all_values[nans] = -1e5
                 values = torch.mean(all_values.reshape((num_models, num_candidates, 1)), dim=0)
@@ -188,3 +192,81 @@ class CEMSafeSetPolicy(Policy):
             max=self.env.action_space.high[0])
 
         return action_samples
+
+    def compute_broil_weights(self, states, weights=None):
+        #for each candidate in states calculate the reward for that candidate with each reward hypothesis then calculate cvar for each candidate
+        broil_lambda=0.5
+        broil_alpha=0.95
+        gamma=0.99
+        broil_risk_metric = "cvar"
+        expert_fcounts = None
+        reward_distribution = PointBotReward()
+        reward_dist = get_reward_distribution(reward_distribution) #hardcoded reward distribution
+        '''batch_returns: list of numpy arrays of size num_rollouts x num_reward_fns
+           weights: list of weights, e.g. advantages, rewards to go, etc by reward function over all rollouts,
+            size is num_rollouts*ave_rollout_length x num_reward_fns
+        '''
+        #inputs are lists of numpy arrays
+        #need to compute BROIL weights for policy gradient and convert to pytorch
+
+        #first find the expected on-policy return for current policy under each reward function in the posterior
+        # exp_batch_rets = np.mean(batch_rets.numpy(), axis=0)
+        # posterior_reward_weights = reward_dist.posterior
+        reward_hypotheses = [None] #either hardcoded or from demonstrations
+        batch_rewards = np.zeros(list(states.shape).append(len(reward_hypotheses))) #(num_cand, horizon, ac_dim, num_reward_hypotheses)
+        for cand in states:
+            for i in reward_hypotheses:
+                #TODO calculate reward for each cand under reward hypotheses i
+                reward = None
+                batch_rewards[:, :, :, i] = reward
+        
+        # if expert_fcounts is not None:
+        #     reward_weights = reward_dist.get_posterior_weight_matrix()
+        #     expert_returns = np.dot(reward_weights, expert_fcounts)
+        #     exp_batch_rets -= expert_returns #baseline with what expert would have gotten under each reward function
+
+        #TODO use cvar to calculate to compute a reward for each traj using the rewards from the difference hypotheses
+
+        #calculate sigma and find either the conditional value at risk or entropic risk measure given the current policy
+        if broil_risk_metric == "cvar":
+            #Calculate policy gradient for conditional value at risk
+
+            sigma, cvar = cvar_enumerate_pg(exp_batch_rets, posterior_reward_weights, broil_alpha) #TODO replace with rewards for each traj
+           # print("sigma = {}, cvar = {}".format(sigma, cvar))
+
+            #compute BROIL policy gradient weights
+            total_rollout_steps = len(weights)
+            broil_weights = np.zeros(total_rollout_steps, dtype=np.float64)
+            for i, prob_r in enumerate(posterior_reward_weights):
+                if sigma >= exp_batch_rets[i]:
+                    w_r_i = broil_lambda + (1 - broil_lambda) / (1 - broil_alpha)
+                else:
+                    w_r_i = broil_lambda
+                broil_weights += prob_r * w_r_i * np.array(weights)[:,i]
+
+            return broil_values
+
+        # elif broil_risk_metric == "erm":
+        #     #calculate policy gradient for entropic risk measure
+        #     erm = -1.0 / broil_alpha * np.log(np.dot(posterior_reward_weights, np.exp(-broil_alpha * exp_batch_rets)))
+
+        #     #compute stable weighted soft-max
+        #     exponents = -broil_alpha * exp_batch_rets
+        #     z = exponents - max(exponents)
+        #     numerators = np.exp(z)
+        #     denominator = np.dot(numerators, posterior_reward_weights)
+        #     softmax_probs = numerators / denominator
+
+        #     #compute BROIL policy gradient weights for ERM
+        #     total_rollout_steps = len(weights)
+        #     erm_weights = broil_lambda * np.ones(len(posterior_reward_weights)) + (1-broil_lambda) * softmax_probs
+
+        #     broil_weights = np.array(weights) * erm_weights
+        #     broil_weights = np.dot(broil_weights, posterior_reward_weights)
+
+        #     return broil_weights,erm
+
+        else:
+            print("Risk metric not implemented!")
+            raise NotImplementedError
+

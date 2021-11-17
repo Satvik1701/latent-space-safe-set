@@ -16,7 +16,7 @@ def parse_args():
                         help='How frequently to save model checkpoints')
     parser.add_argument('--checkpoint_folder', type=str, default=None)
     parser.add_argument('--traj_per_update', default=10, type=int)
-    parser.add_argument('--num_updates', type=int, default=25)
+    parser.add_argument('--num_updates', type=int, default=10) #25
     parser.add_argument('--exper_name', type=str, default=None)
 
     add_controller_args(parser)
@@ -84,7 +84,7 @@ def add_ss_args(parser):
     parser.add_argument('--safe_set_n_models', type=int, default=5)
     parser.add_argument('--safe_set_init_iters', type=int, default=10000,
                         help='Initial training iterations')
-    parser.add_argument('--safe_set_ignore', action='store_true')
+    parser.add_argument('--safe_set_ignore', default=False, action='store_true')
     parser.add_argument('--safe_set_update_iters', type=int, default=512)
     parser.add_argument('--safe_set_checkpoint', type=str, default=None)
 
@@ -143,7 +143,7 @@ def add_constr_args(parser):
                         help='Threshold for an obs to be considered in violation of constraints')
     parser.add_argument('--constr_init_iters', type=int, default=10000,
                         help='Initial training iterations')
-    parser.add_argument('--constr_ignore', action='store_true')
+    parser.add_argument('--constr_ignore', default=False, action='store_true')
     parser.add_argument('--constr_update_iters', type=int, default=512)
     parser.add_argument('--constr_checkpoint', type=str, default=None)
 
