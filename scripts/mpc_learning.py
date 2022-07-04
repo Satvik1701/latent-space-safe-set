@@ -60,6 +60,7 @@ if __name__ == '__main__':
     task_succ = []
     n_episodes = 0
 
+    print("START")
     for i in range(num_updates):
         update_dir = os.path.join(logdir, "update_%d" % i)
         os.makedirs(update_dir)

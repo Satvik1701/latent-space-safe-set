@@ -83,7 +83,6 @@ class CEMSafeSetPolicy(Policy):
 
         itr = 0
         reset_count = 0
-        act_ss_thresh = self.safe_set_thresh
         while itr < self.max_iters:
             if itr == 0:
                 # Action samples dim (num_candidates, planning_hor, d_act)
@@ -96,70 +95,27 @@ class CEMSafeSetPolicy(Policy):
                     action_samples_random = self._sample_actions_random(num_random)
                     action_samples = torch.cat((action_samples_dist, action_samples_random), dim=0)
             else:
-                # Chop off the number of elites so we don't use constraint violating trajectories
-
-                # num_constraint_satisfying = sum(values > -1e5)
-                #iter_num_elites = min(num_constraint_satisfying, self.num_elites)
                 iter_num_elites = self.num_elites
-                # if num_constraint_satisfying == 0:
-                #     reset_count += 1
-                #     act_ss_thresh *= self.safe_set_thresh_mult
-                #     if reset_count > self.safe_set_thresh_mult_iters:
-                #         self.mean = None
-                #         return self.env.action_space.sample()
-
-                #     itr = 0
-                #     self.mean, self.std = None, None
-                #     continue
-
+                predictions = self.dynamics_model.predict(emb, action_samples, already_embedded=True) #get states associated with action_samples
+                #rollout the action_samples using the actual simulator to get the predictions
+                num_models, num_candidates, planning_hor, d_latent = predictions.shape #remove num_model
+                predictions = predictions.mean(0).squeeze()
                 # Sort
+                values = self.compute_broil_rewards(predictions, action_samples)
+                values = values.squeeze()
+
                 sortid = values.argsort()
                 actions_sorted = action_samples[sortid]
                 elites = actions_sorted[-iter_num_elites:]
 
                 # Refitting to Best Trajs
                 self.mean, self.std = elites.mean(0), elites.std(0)
-
                 action_samples = self._sample_actions_normal(self.mean, self.std)
 
-            if itr < self.max_iters - 1:
-                # dimension (num_models, num_candidates, planning_hor, d_latent)
-                predictions = self.dynamics_model.predict(emb, action_samples, already_embedded=True)
-                num_models, num_candidates, planning_hor, d_latent = predictions.shape
-
-                last_states = predictions[:, :, -1, :].reshape(
-                    (num_models * num_candidates, d_latent))
-                #all_values = self.value_function.get_value(last_states, already_embedded=True) 
-                all_values = self.compute_broil_weights(last_states) #use compute broil weights to compute values for cem candidates instead of value function
-                nans = torch.isnan(all_values)
-                all_values[nans] = -1e5
-                values = torch.mean(all_values.reshape((num_models, num_candidates, 1)), dim=0)
-
-                # Blow up cost for trajectories that are not constraint satisfying and/or don't end up
-                #   in the safe set
-                if not self.ignore_constraints:
-                    constraints_all = torch.sigmoid(self.constraint_function(predictions, already_embedded=True))
-                    constraint_viols = torch.sum(torch.max(constraints_all, dim=0)[0] > self.constraint_thresh, dim=1)
-                else:
-                    constraint_viols = torch.zeros((num_candidates, 1), device=ptu.TORCH_DEVICE)
-
-                if not self.ignore_safe_set:
-                    safe_set_all = self.safe_set.safe_set_probability(last_states, already_embedded=True)
-                    safe_set_viols = torch.mean(safe_set_all
-                                                .reshape((num_models, num_candidates, 1)),
-                                                dim=0) < act_ss_thresh
-                else:
-                    safe_set_viols = torch.zeros((num_candidates, 1), device=ptu.TORCH_DEVICE)
-                goal_preds = self.goal_indicator(predictions, already_embedded=True)
-                goal_states = torch.sum(torch.mean(goal_preds, dim=0) > self.goal_thresh, dim=1)
-
-                values = values + (constraint_viols + safe_set_viols) * -1e5 + goal_states
-                values = values.squeeze()
-
             itr += 1
-
         # Return the best action
         action = actions_sorted[-1][0]
+        print(action)
         return action.detach().cpu().numpy()
 
     def reset(self):
@@ -193,15 +149,24 @@ class CEMSafeSetPolicy(Policy):
 
         return action_samples
 
-    def compute_broil_weights(self, states, weights=None):
+    def get_reward_hypotheses(self):
+        #reward_hypotheses = [num_reward_hypotheses X latent_space_size]
+        #Each reward hypothesis: R(s) --> scalar value
+        #reward_hypotheses = torch.normal(0, 1, size=(10, 32))
+        reward_hypotheses_1 = torch.ones((10, 1))
+        reward_hypotheses = torch.zeros((10, 32))
+        reward_hypotheses[:, 1] = reward_hypotheses_1
+        return reward_hypotheses
+
+    def compute_broil_rewards(self, states, actions):
         #for each candidate in states calculate the reward for that candidate with each reward hypothesis then calculate cvar for each candidate
         broil_lambda=0.5
         broil_alpha=0.95
         gamma=0.99
         broil_risk_metric = "cvar"
         expert_fcounts = None
-        reward_distribution = PointBotReward()
-        reward_dist = get_reward_distribution(reward_distribution) #hardcoded reward distribution
+        # reward_distribution = PointBotReward()
+        # reward_dist = get_reward_distribution(reward_distribution) #hardcoded reward distribution
         '''batch_returns: list of numpy arrays of size num_rollouts x num_reward_fns
            weights: list of weights, e.g. advantages, rewards to go, etc by reward function over all rollouts,
             size is num_rollouts*ave_rollout_length x num_reward_fns
@@ -212,61 +177,33 @@ class CEMSafeSetPolicy(Policy):
         #first find the expected on-policy return for current policy under each reward function in the posterior
         # exp_batch_rets = np.mean(batch_rets.numpy(), axis=0)
         # posterior_reward_weights = reward_dist.posterior
-        reward_hypotheses = [None] #either hardcoded or from demonstrations
-        batch_rewards = np.zeros(list(states.shape).append(len(reward_hypotheses))) #(num_cand, horizon, ac_dim, num_reward_hypotheses)
-        for cand in states:
-            for i in reward_hypotheses:
-                #TODO calculate reward for each cand under reward hypotheses i
-                reward = None
-                batch_rewards[:, :, :, i] = reward
+
+        reward_hypotheses = self.get_reward_hypotheses() #matrix where each row is a reward hypothesis with len()=horizon
+        W = reward_hypotheses #[num reward hypotheses X latent_space_size]
+        len_rew_hypo = W.shape[0]
+        num_cand, horizon, ac_dim = states.shape
+        posterior_reward_weights = torch.full((1, len_rew_hypo), 1/len_rew_hypo).squeeze()
+        batch_rewards = torch.zeros((num_cand, len_rew_hypo)) #(num_cand, num_reward_hypotheses), omit horizon and ac_dim
+
+        #compute over the horizon
+        for i in range(num_cand):
+            curr_cand_rew = torch.zeros(len_rew_hypo)
+            for j in range(horizon):
+                curr_sample_traj = states[i, j, :].squeeze()
+                rewards_curr_sample = torch.matmul(W, curr_sample_traj).squeeze() #dim = [num_reward_hypo X 1], rewards for each hypothesis for this traj
+                curr_cand_rew.add_(rewards_curr_sample)
+            
+            batch_rewards[i, :] = curr_cand_rew
+
+        exp_batch_rets = torch.mean(batch_rewards, axis=0)
         
-        # if expert_fcounts is not None:
-        #     reward_weights = reward_dist.get_posterior_weight_matrix()
-        #     expert_returns = np.dot(reward_weights, expert_fcounts)
-        #     exp_batch_rets -= expert_returns #baseline with what expert would have gotten under each reward function
-
-        #TODO use cvar to calculate to compute a reward for each traj using the rewards from the difference hypotheses
-
-        #calculate sigma and find either the conditional value at risk or entropic risk measure given the current policy
-        if broil_risk_metric == "cvar":
-            #Calculate policy gradient for conditional value at risk
-
-            sigma, cvar = cvar_enumerate_pg(exp_batch_rets, posterior_reward_weights, broil_alpha) #TODO replace with rewards for each traj
-           # print("sigma = {}, cvar = {}".format(sigma, cvar))
-
-            #compute BROIL policy gradient weights
-            total_rollout_steps = len(weights)
-            broil_weights = np.zeros(total_rollout_steps, dtype=np.float64)
-            for i, prob_r in enumerate(posterior_reward_weights):
-                if sigma >= exp_batch_rets[i]:
-                    w_r_i = broil_lambda + (1 - broil_lambda) / (1 - broil_alpha)
-                else:
-                    w_r_i = broil_lambda
-                broil_weights += prob_r * w_r_i * np.array(weights)[:,i]
-
-            return broil_values
-
-        # elif broil_risk_metric == "erm":
-        #     #calculate policy gradient for entropic risk measure
-        #     erm = -1.0 / broil_alpha * np.log(np.dot(posterior_reward_weights, np.exp(-broil_alpha * exp_batch_rets)))
-
-        #     #compute stable weighted soft-max
-        #     exponents = -broil_alpha * exp_batch_rets
-        #     z = exponents - max(exponents)
-        #     numerators = np.exp(z)
-        #     denominator = np.dot(numerators, posterior_reward_weights)
-        #     softmax_probs = numerators / denominator
-
-        #     #compute BROIL policy gradient weights for ERM
-        #     total_rollout_steps = len(weights)
-        #     erm_weights = broil_lambda * np.ones(len(posterior_reward_weights)) + (1-broil_lambda) * softmax_probs
-
-        #     broil_weights = np.array(weights) * erm_weights
-        #     broil_weights = np.dot(broil_weights, posterior_reward_weights)
-
-        #     return broil_weights,erm
-
-        else:
-            print("Risk metric not implemented!")
-            raise NotImplementedError
+        cand_broil_values = torch.zeros(num_cand)
+        for i in range(num_cand):
+            rewards_curr_sample = batch_rewards[i]
+            sigma, cvar = cvar_enumerate_pg(rewards_curr_sample, posterior_reward_weights, broil_alpha)
+            # print("sigma = {}, cvar = {}".format(sigma, cvar))
+        
+            expected_curr_rew_sample = torch.dot(rewards_curr_sample, posterior_reward_weights) #weighted average
+            cand_broil_values[i] = broil_lambda * expected_curr_rew_sample + (1 - broil_lambda) * cvar
+        return cand_broil_values
 
